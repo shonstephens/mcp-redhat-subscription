@@ -81,8 +81,49 @@ async function apiDownload(path, outputPath) {
   return buffer.length;
 }
 
-function jsonResponse(data) {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+// --- Response pagination ---
+// `limit`/`offset` are reserved on most tools for UPSTREAM Red Hat API
+// row pagination. Response-character pagination uses respOffset/respLimit
+// to avoid collision.
+
+const DEFAULT_CHUNK = 30000;
+
+function paginate(text, respOffset, respLimit, label) {
+  const total = text.length;
+  const start = Math.min(respOffset, total);
+  const end = Math.min(start + respLimit, total);
+  const slice = text.slice(start, end);
+  const header = `# ${label}\n# chars ${start}-${end} of ${total}\n\n`;
+  const footer =
+    end < total
+      ? `\n\n[truncated: showing chars ${start}-${end} of ${total}. Call again with respOffset=${end} for the next chunk.]`
+      : "";
+  return `${header}${slice}${footer}`;
+}
+
+const paginationSchema = {
+  respOffset: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .default(0)
+    .describe(`Byte offset into the rendered response. Default 0. Use the value from the previous call's "[truncated]" footer to fetch the next chunk. Distinct from upstream API \`offset\`.`),
+  respLimit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(DEFAULT_CHUNK)
+    .describe(`Maximum characters to return in this call. Default ${DEFAULT_CHUNK} keeps responses under typical MCP tool-result token caps. Distinct from upstream API \`limit\`.`),
+};
+
+function jsonResponse(data, respOffset, respLimit, label) {
+  const text = JSON.stringify(data, null, 2);
+  if (respOffset === undefined && respLimit === undefined) {
+    return { content: [{ type: "text", text }] };
+  }
+  return { content: [{ type: "text", text: paginate(text, respOffset ?? 0, respLimit ?? DEFAULT_CHUNK, label ?? "response") }] };
 }
 
 function paginationParams(limit, offset) {
@@ -91,7 +132,7 @@ function paginationParams(limit, offset) {
 
 const server = new McpServer({
   name: "mcp-redhat-subscription",
-  version: "2.0.0",
+  version: "2.1.0",
 });
 
 // === Subscriptions ===
@@ -99,16 +140,17 @@ const server = new McpServer({
 server.registerTool(
   "listSubscriptions",
   {
-    description: "List Red Hat subscriptions for the authenticated account",
+    description: "List Red Hat subscriptions for the authenticated account. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       limit: z.number().optional().default(50).describe("Maximum results to return (default 50)"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ limit, offset }) => {
+  async ({ limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/subscriptions?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, "listSubscriptions");
   }
 );
 
@@ -127,34 +169,36 @@ server.registerTool(
 server.registerTool(
   "listSubscriptionContentSets",
   {
-    description: "List all content sets for a subscription",
+    description: "List all content sets for a subscription. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       subscriptionNumber: z.string().describe("The subscription number"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ subscriptionNumber, limit, offset }) => {
+  async ({ subscriptionNumber, limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/subscriptions/${subscriptionNumber}/contentSets?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listSubscriptionContentSets: ${subscriptionNumber}`);
   }
 );
 
 server.registerTool(
   "listSubscriptionSystems",
   {
-    description: "List all systems consuming a subscription",
+    description: "List all systems consuming a subscription. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       subscriptionNumber: z.string().describe("The subscription number"),
       limit: z.number().optional().default(100).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ subscriptionNumber, limit, offset }) => {
+  async ({ subscriptionNumber, limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/subscriptions/${subscriptionNumber}/systems?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listSubscriptionSystems: ${subscriptionNumber}`);
   }
 );
 
@@ -163,21 +207,22 @@ server.registerTool(
 server.registerTool(
   "listSystems",
   {
-    description: "List systems registered with Red Hat Subscription Management",
+    description: "List systems registered with Red Hat Subscription Management. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       limit: z.number().optional().default(100).describe("Maximum results to return (default 100)"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
       filter: z.string().optional().describe("Filter systems by system name"),
       username: z.string().optional().describe("Filter systems by registered username"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ limit, offset, filter, username }) => {
+  async ({ limit, offset, filter, username, respOffset, respLimit }) => {
     const params = paginationParams(limit, offset);
     if (filter) params.set("filter", filter);
     if (username) params.set("username", username);
     const data = await apiRequest(`/systems?${params}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, "listSystems");
   }
 );
 
@@ -250,58 +295,61 @@ server.registerTool(
 server.registerTool(
   "listSystemErrata",
   {
-    description: "List all applicable errata for a system",
+    description: "List all applicable errata for a system. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       systemUuid: z.string().describe("The system UUID"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ systemUuid, limit, offset }) => {
+  async ({ systemUuid, limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/systems/${systemUuid}/errata?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listSystemErrata: ${systemUuid}`);
   }
 );
 
 server.registerTool(
   "listSystemPackages",
   {
-    description: "List all packages for a system",
+    description: "List all packages for a system. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       systemUuid: z.string().describe("The system UUID"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
       errataDetail: z.boolean().optional().describe("Show errata details for packages"),
       upgradeable: z.boolean().optional().describe("Show upgradable packages only"),
       filter: z.string().optional().describe("Filter packages by name"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ systemUuid, limit, offset, errataDetail, upgradeable, filter }) => {
+  async ({ systemUuid, limit, offset, errataDetail, upgradeable, filter, respOffset, respLimit }) => {
     const params = paginationParams(limit, offset);
     if (errataDetail) params.set("errata_detail", "true");
     if (upgradeable) params.set("upgradeable", "true");
     if (filter) params.set("filter", filter);
     const data = await apiRequest(`/systems/${systemUuid}/packages?${params}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listSystemPackages: ${systemUuid}`);
   }
 );
 
 server.registerTool(
   "listSystemPools",
   {
-    description: "List all pools for a system",
+    description: "List all pools for a system. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       systemUuid: z.string().describe("The system UUID"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ systemUuid, limit, offset }) => {
+  async ({ systemUuid, limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/systems/${systemUuid}/pools?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listSystemPools: ${systemUuid}`);
   }
 );
 
@@ -310,19 +358,20 @@ server.registerTool(
 server.registerTool(
   "listAllocations",
   {
-    description: "List subscription allocations (Satellite manifests)",
+    description: "List subscription allocations (Satellite manifests). Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
       type: z.string().optional().describe("Filter by allocation type"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ limit, offset, type }) => {
+  async ({ limit, offset, type, respOffset, respLimit }) => {
     const params = paginationParams(limit, offset);
     if (type) params.set("type", type);
     const data = await apiRequest(`/allocations?${params}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, "listAllocations");
   }
 );
 
@@ -406,30 +455,31 @@ server.registerTool(
 server.registerTool(
   "listAllocationVersions",
   {
-    description: "List available Satellite versions for allocations",
-    inputSchema: {},
+    description: "List available Satellite versions for allocations. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
+    inputSchema: { ...paginationSchema },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async () => jsonResponse(await apiRequest("/allocations/versions"))
+  async ({ respOffset, respLimit }) => jsonResponse(await apiRequest("/allocations/versions"), respOffset, respLimit, "listAllocationVersions")
 );
 
 server.registerTool(
   "listAllocationPools",
   {
-    description: "List all pools available for an allocation",
+    description: "List all pools available for an allocation. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       allocationUuid: z.string().describe("The allocation UUID"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
       future: z.boolean().optional().describe("Include future dated pools (Satellite 6.3+)"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ allocationUuid, limit, offset, future }) => {
+  async ({ allocationUuid, limit, offset, future, respOffset, respLimit }) => {
     const params = paginationParams(limit, offset);
     if (future) params.set("future", "true");
     const data = await apiRequest(`/allocations/${allocationUuid}/pools?${params}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listAllocationPools: ${allocationUuid}`);
   }
 );
 
@@ -535,34 +585,36 @@ server.registerTool(
 server.registerTool(
   "listErrata",
   {
-    description: "List all errata applicable to the user's systems",
+    description: "List all errata applicable to the user's systems. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ limit, offset }) => {
+  async ({ limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/errata?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, "listErrata");
   }
 );
 
 server.registerTool(
   "listErrataByContentSetArch",
   {
-    description: "List all errata for a specific content set and architecture",
+    description: "List all errata for a specific content set and architecture. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       contentSet: z.string().describe("The content set label"),
       arch: z.string().describe("The architecture (e.g. 'x86_64')"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ contentSet, arch, limit, offset }) => {
+  async ({ contentSet, arch, limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/errata/cset/${encodeURIComponent(contentSet)}/arch/${encodeURIComponent(arch)}?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listErrataByContentSetArch: ${contentSet}/${arch}`);
   }
 );
 
@@ -581,46 +633,49 @@ server.registerTool(
 server.registerTool(
   "listErratumImages",
   {
-    description: "List all updated container images for an advisory",
+    description: "List all updated container images for an advisory. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       advisoryId: z.string().describe("The advisory ID"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ advisoryId }) => jsonResponse(await apiRequest(`/errata/${encodeURIComponent(advisoryId)}/images`))
+  async ({ advisoryId, respOffset, respLimit }) => jsonResponse(await apiRequest(`/errata/${encodeURIComponent(advisoryId)}/images`), respOffset, respLimit, `listErratumImages: ${advisoryId}`)
 );
 
 server.registerTool(
   "listErratumPackages",
   {
-    description: "List all packages for an advisory",
+    description: "List all packages for an advisory. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       advisoryId: z.string().describe("The advisory ID"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ advisoryId, limit, offset }) => {
+  async ({ advisoryId, limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/errata/${encodeURIComponent(advisoryId)}/packages?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listErratumPackages: ${advisoryId}`);
   }
 );
 
 server.registerTool(
   "listErratumSystems",
   {
-    description: "List all systems affected by an advisory",
+    description: "List all systems affected by an advisory. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       advisoryId: z.string().describe("The advisory ID"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ advisoryId, limit, offset }) => {
+  async ({ advisoryId, limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/errata/${encodeURIComponent(advisoryId)}/systems?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listErratumSystems: ${advisoryId}`);
   }
 );
 
@@ -629,32 +684,34 @@ server.registerTool(
 server.registerTool(
   "listImagesByContentSet",
   {
-    description: "List available images in a content set",
+    description: "List available images in a content set. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       contentSet: z.string().describe("The content set label"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ contentSet, limit, offset }) => {
+  async ({ contentSet, limit, offset, respOffset, respLimit }) => {
     const data = await apiRequest(`/images/cset/${encodeURIComponent(contentSet)}?${paginationParams(limit, offset)}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listImagesByContentSet: ${contentSet}`);
   }
 );
 
 server.registerTool(
   "listImageDownloads",
   {
-    description: "List RHEL image downloads by version and architecture",
+    description: "List RHEL image downloads by version and architecture. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       version: z.string().describe("RHEL version (e.g. '9.4')"),
       arch: z.string().describe("Architecture (e.g. 'x86_64')"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ version, arch }) => {
-    return jsonResponse(await apiRequest(`/images/rhel/${encodeURIComponent(version)}/${encodeURIComponent(arch)}`));
+  async ({ version, arch, respOffset, respLimit }) => {
+    return jsonResponse(await apiRequest(`/images/rhel/${encodeURIComponent(version)}/${encodeURIComponent(arch)}`), respOffset, respLimit, `listImageDownloads: ${version}/${arch}`);
   }
 );
 
@@ -679,21 +736,22 @@ server.registerTool(
 server.registerTool(
   "listPackagesByContentSetArch",
   {
-    description: "List all packages for a content set and architecture",
+    description: "List all packages for a content set and architecture. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
     inputSchema: {
       contentSet: z.string().describe("The content set label"),
       arch: z.string().describe("The architecture (e.g. 'x86_64')"),
       limit: z.number().optional().default(50).describe("Maximum results to return"),
-      offset: z.number().optional().default(0).describe("Pagination offset"),
+      offset: z.number().optional().default(0).describe("Upstream API pagination offset"),
       filter: z.string().optional().describe("Filter packages by name"),
+      ...paginationSchema,
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ contentSet, arch, limit, offset, filter }) => {
+  async ({ contentSet, arch, limit, offset, filter, respOffset, respLimit }) => {
     const params = paginationParams(limit, offset);
     if (filter) params.set("filter", filter);
     const data = await apiRequest(`/packages/cset/${encodeURIComponent(contentSet)}/arch/${encodeURIComponent(arch)}?${params}`);
-    return jsonResponse(data);
+    return jsonResponse(data, respOffset, respLimit, `listPackagesByContentSetArch: ${contentSet}/${arch}`);
   }
 );
 
@@ -730,11 +788,11 @@ server.registerTool(
 server.registerTool(
   "listCloudAccessProviders",
   {
-    description: "List all enabled cloud access providers for the account",
-    inputSchema: {},
+    description: "List all enabled cloud access providers for the account. Large responses are paginated — call repeatedly with `respOffset` to read subsequent chunks.",
+    inputSchema: { ...paginationSchema },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async () => jsonResponse(await apiRequest("/cloud_access_providers/enabled"))
+  async ({ respOffset, respLimit }) => jsonResponse(await apiRequest("/cloud_access_providers/enabled"), respOffset, respLimit, "listCloudAccessProviders")
 );
 
 server.registerTool(
