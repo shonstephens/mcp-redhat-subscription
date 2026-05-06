@@ -89,6 +89,18 @@ An [MCP](https://modelcontextprotocol.io/) server for the Red Hat Subscription M
 |------|-------------|
 | `getOrganization` | Get organization details including SCA capability |
 
+## Pagination
+
+All `list*` tools accept optional `respOffset` (default 0) and `respLimit` (default 30000) parameters to chunk response output. Large list results (e.g. `listSystemPackages` for a system with thousands of packages, `listSystems` at scale) can exceed typical MCP tool-result token caps when returned whole. When a response is truncated, the output ends with a footer like:
+
+```
+[truncated: showing chars 0-30000 of 102783. Call again with respOffset=30000 for the next chunk.]
+```
+
+Pass that `respOffset` back to fetch the next chunk. Small responses return in one call.
+
+**Naming note:** `limit`/`offset` are reserved on most tools for upstream Red Hat API row-pagination (e.g. `limit=1000` to fetch 1000 system records from the API). Response-character pagination uses `respOffset`/`respLimit` to avoid collision. Both layers can be used together — for example, `limit=1000` to retrieve many rows, then `respOffset` to page through the rendered JSON in chunks.
+
 ## Prerequisites
 
 - Node.js 18+
